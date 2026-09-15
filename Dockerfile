@@ -25,5 +25,5 @@ COPY static/ static/
 USER 10001
 EXPOSE 8080
 
-CMD gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 \
+CMD exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 \
     --timeout 900 --access-logfile - app:app
