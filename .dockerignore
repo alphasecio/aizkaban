@@ -1,0 +1,25 @@
+# Git and docs
+.git/
+.gitignore
+README.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local environment and secrets
+.env
+*-key.json
+service-account*.json
+credentials.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Not needed inside the image
+Dockerfile
+.dockerignore
