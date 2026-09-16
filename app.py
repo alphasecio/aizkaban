@@ -17,12 +17,17 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from flask import Flask, Response, redirect, render_template, url_for
+from flask import Flask, Response, redirect, render_template, request, url_for
 from google.api_core import exceptions as gexc
 from google.cloud import asset_v1
 from google.protobuf.json_format import MessageToDict
 
 APP_VERSION = "0.1.0"
+
+# Raise this when the snapshot layout changes. A stored snapshot with a
+# different number is ignored, and the app scans again. This stops an old
+# snapshot from a previous version breaking the dashboard.
+SNAPSHOT_SCHEMA = 1
 
 # The Gemini API (generativelanguage) became public in March 2023. A key
 # made before this date cannot have been made for Gemini. Any Gemini
@@ -89,6 +94,67 @@ FAVICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
 
 # ── Persistence ──────────────────────────────────────────────────────────
 
+_SNAPSHOT_COUNTS = ("scanned_at", "org_id")
+_SNAPSHOT_NUMBERS = (
+    "projects_total",
+    "projects_flagged",
+    "projects_gemini",
+    "keys_total",
+)
+_FINDING_TEXT = ("severity", "project", "key_name", "created", "expires",
+                 "app_restriction")
+
+
+def validate_snapshot(snapshot):
+    """Check a stored snapshot and fill in anything missing.
+
+    A snapshot written by an older version of this app can lack fields
+    that the page needs. Rendering it would fail. Return None for a
+    snapshot this version cannot use, so the caller scans again.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    if snapshot.get("schema") != SNAPSHOT_SCHEMA:
+        log.warning("Ignoring a stored snapshot from a different version.")
+        return None
+    for key in _SNAPSHOT_COUNTS:
+        if not isinstance(snapshot.get(key), str):
+            log.warning("Ignoring a stored snapshot: %s is missing.", key)
+            return None
+    if not isinstance(snapshot.get("findings"), list):
+        log.warning("Ignoring a stored snapshot: findings is missing.")
+        return None
+
+    for key in _SNAPSHOT_NUMBERS:
+        if not isinstance(snapshot.get(key), int):
+            snapshot[key] = 0
+    counts = snapshot.get("counts")
+    if not isinstance(counts, dict):
+        counts = {}
+    snapshot["counts"] = {
+        level: counts.get(level, 0) if isinstance(counts.get(level), int) else 0
+        for level in SEVERITY_ORDER
+    }
+    if not isinstance(snapshot.get("org_domain"), str):
+        snapshot["org_domain"] = None
+
+    findings = []
+    for finding in snapshot["findings"]:
+        if not isinstance(finding, dict):
+            continue
+        if finding.get("severity") not in SEVERITY_ORDER:
+            continue
+        for key in _FINDING_TEXT:
+            if not isinstance(finding.get(key), str):
+                finding[key] = ""
+        if not isinstance(finding.get("api_targets"), list):
+            finding["api_targets"] = []
+        finding["gemini_scoped"] = bool(finding.get("gemini_scoped"))
+        finding["pre_gemini"] = bool(finding.get("pre_gemini"))
+        findings.append(finding)
+    snapshot["findings"] = findings
+    return snapshot
+
 
 class MemoryStore:
     """Keeps the last scan in memory. Loses it when the container restarts."""
@@ -117,7 +183,7 @@ class BucketStore:
 
     def load(self):
         try:
-            return json.loads(self._blob.download_as_bytes())
+            return validate_snapshot(json.loads(self._blob.download_as_bytes()))
         except gexc.NotFound:
             return None
         except Exception:
@@ -340,6 +406,7 @@ def scan():
     }
 
     snapshot = {
+        "schema": SNAPSHOT_SCHEMA,
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "org_id": ORG_ID,
         "org_domain": org_domain,
@@ -360,23 +427,34 @@ def scan():
 _scan_lock = threading.Lock()
 _last_scan_at = 0.0
 _SCAN_DEBOUNCE_SECONDS = 5
-_SCAN_WAIT_TIMEOUT = 120
+
+
+def scan_running():
+    """Return True if a scan is running right now."""
+    return _scan_lock.locked()
 
 
 def run_scan():
     """Run a scan and save it. Return (snapshot, error_message).
 
-    If a scan is already running, this waits for it instead of failing.
-    Without this, an automatic first-load scan and a manual click could
-    race. The one that lost the race used to show a false error, even
-    though the other scan finished fine.
+    This never waits for another scan to finish. A request that arrives
+    during a scan returns at once, with whatever is stored and no error.
+    The page then shows that a scan is running and reloads itself.
+
+    Waiting here would tie up a worker thread for the length of a scan.
+    Enough waiting requests would use every thread in the pool, and the
+    service would stop answering.
+
+    Returning no error also matters. An automatic first-load scan and a
+    manual click can arrive together. The second one is not a failure, so
+    it must not show an error.
 
     A short cooldown after a finished scan stops a fast double-click from
     starting a second scan.
     """
     global _last_scan_at
-    if not _scan_lock.acquire(timeout=_SCAN_WAIT_TIMEOUT):
-        return store.load(), "The scan is taking too long. Please try again."
+    if not _scan_lock.acquire(blocking=False):
+        return store.load(), None
     try:
         if time.monotonic() - _last_scan_at < _SCAN_DEBOUNCE_SECONDS:
             return store.load(), None
@@ -413,7 +491,7 @@ def group_findings(findings):
     return grouped
 
 
-def render_dashboard(snapshot, error=None, export=False):
+def render_dashboard(snapshot, error=None, export=False, scanning=False):
     notices = []
     if error:
         notices.append({"level": "error", "text": error})
@@ -429,6 +507,7 @@ def render_dashboard(snapshot, error=None, export=False):
     context = {
         "subtitle": "API Key Audit Report" if export else "API Key Auditor",
         "export": export,
+        "scanning": scanning and not export,
         "version": APP_VERSION,
         "org_id": snapshot["org_id"] if snapshot else ORG_ID,
         "org_domain": snapshot.get("org_domain") if snapshot else None,
@@ -472,11 +551,18 @@ def dashboard():
     if snapshot is None:
         # First visit after a deploy: scan now so the page is never empty.
         snapshot, error = run_scan()
-    return render_dashboard(snapshot, error)
+    return render_dashboard(snapshot, error, scanning=scan_running())
 
 
 @app.post("/scan")
 def rescan():
+    # Reject a form sent from another site. A browser reports where a
+    # request came from in Sec-Fetch-Site. Our own form reports
+    # "same-origin". A form on an attacker's page reports "cross-site".
+    # A browser too old to send the header is allowed through, because
+    # the worst an attacker gains is one extra scan.
+    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+        return Response("Cross-site requests are not allowed.", status=403)
     run_scan()
     return redirect(url_for("dashboard"))
 
