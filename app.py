@@ -24,16 +24,26 @@ from google.protobuf.json_format import MessageToDict
 
 APP_VERSION = "0.1.0"
 
-# Raise this when the snapshot layout changes. A stored snapshot with a
-# different number is ignored, and the app scans again. This stops an old
-# snapshot from a previous version breaking the dashboard.
-SNAPSHOT_SCHEMA = 1
+# Raise this when the snapshot layout changes, or when a change to the
+# scan alters what the stored results mean. A stored snapshot with a
+# different number is ignored, and the app scans again.
+SNAPSHOT_SCHEMA = 2
 
 # The Gemini API (generativelanguage) became public in March 2023. A key
 # made before this date cannot have been made for Gemini. Any Gemini
 # access such a key has was added later, often without anyone meaning to.
 PRE_GEMINI_CUTOFF = "2023-03-01T00:00:00Z"
-GEMINI_SERVICE = "generativelanguage.googleapis.com"
+# Gemini is served through more than one API. A key can reach it through
+# Google AI Studio, and through Vertex AI in express mode, which accepts
+# an API key in place of OAuth credentials.
+#
+# Gemini Code Assist (cloudaicompanion.googleapis.com) is not listed
+# here. It accepts only OAuth credentials and a per-user licence, so an
+# API key cannot call it. Listing it would raise false alarms.
+GEMINI_SERVICES = (
+    "generativelanguage.googleapis.com",
+    "aiplatform.googleapis.com",
+)
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "low": 2, "info": 3}
 CARDS = (
@@ -191,9 +201,10 @@ class BucketStore:
             return None
 
     def save(self, snapshot):
-        self._blob.upload_from_string(
-            json.dumps(snapshot), content_type="application/json"
-        )
+        # Write straight to the object. Building the whole JSON string
+        # first would hold a second copy of every finding in memory.
+        with self._blob.open("w", content_type="application/json") as stream:
+            json.dump(snapshot, stream)
 
 
 def build_store():
@@ -278,11 +289,17 @@ def fetch_projects(parent):
 
 
 def fetch_gemini_projects(scope):
-    """Return the set of project numbers where Gemini is enabled."""
+    """Return the set of project numbers where Gemini is enabled.
+
+    Cloud Asset Inventory accepts OR between comparisons, so one query
+    covers every Gemini service. Keep the OR group in its own brackets:
+    mixing AND and OR inside one bracket is not valid.
+    """
+    services = " OR ".join(f"name:*{service}*" for service in GEMINI_SERVICES)
     request = asset_v1.SearchAllResourcesRequest(
         scope=scope,
         asset_types=["serviceusage.googleapis.com/Service"],
-        query=f"state:ENABLED AND name:*{GEMINI_SERVICE}*",
+        query=f"state:ENABLED AND ({services})",
     )
     enabled = set()
     for result in get_asset_client().search_all_resources(request=request):
@@ -330,7 +347,7 @@ def classify(asset, projects, gemini_projects):
 
     if api_targets is None:
         key_type = "unrestricted"
-    elif GEMINI_SERVICE in services:
+    elif any(service in GEMINI_SERVICES for service in services):
         key_type = "gemini_scoped"
     else:
         key_type = "restricted"
@@ -558,10 +575,13 @@ def dashboard():
 def rescan():
     # Reject a form sent from another site. A browser reports where a
     # request came from in Sec-Fetch-Site. Our own form reports
-    # "same-origin". A form on an attacker's page reports "cross-site".
+    # "same-origin". Accept nothing else: "same-site" covers any other
+    # host under the same registrable domain, which on a custom domain
+    # could be a different, less trusted application.
     # A browser too old to send the header is allowed through, because
     # the worst an attacker gains is one extra scan.
-    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+    fetch_site = request.headers.get("Sec-Fetch-Site")
+    if fetch_site is not None and fetch_site != "same-origin":
         return Response("Cross-site requests are not allowed.", status=403)
     run_scan()
     return redirect(url_for("dashboard"))
