@@ -6,12 +6,11 @@
 <meta name="robots" content="noindex,nofollow">
 <title>AIzkaban — {{ subtitle }}</title>
 {% if export %}
-{# The export is a standalone file. CSS, JS and the favicon are inlined
-   so the file still works when opened later with no network and no
-   running server. #}
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <link rel="icon" type="image/svg+xml" href="{{ favicon_data_uri }}">
 <style>{{ inline_css|safe }}</style>
 {% else %}
+{% if scanning %}<meta http-equiv="refresh" content="5">{% endif %}
 <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ version }}">
 {% endif %}
@@ -154,7 +153,13 @@
 {% endfor %}
 
 {% else %}
-<div class="empty-state">No scan data yet. Run a scan to fill the dashboard.</div>
+<div class="empty-state">
+  {% if scanning %}
+  A scan is running. This page reloads on its own.
+  {% else %}
+  No scan data yet. Run a scan to fill the dashboard.
+  {% endif %}
+</div>
 {% endif %}
 
 </main>
