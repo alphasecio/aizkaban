@@ -69,7 +69,7 @@ gcloud storage buckets create gs://PROJECT_ID-aizkaban \
 
 gcloud storage buckets add-iam-policy-binding gs://PROJECT_ID-aizkaban \
   --member "serviceAccount:aizkaban-sa@PROJECT_ID.iam.gserviceaccount.com" \
-  --role roles/storage.objectAdmin
+  --role roles/storage.objectUser
 ```
 
 ### 4. Deploy
