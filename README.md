@@ -109,7 +109,7 @@ gcloud run services add-iam-policy-binding aizkaban \
 
 `ORG_ID` must be a number. The service will not start without it.
 
-## Use
+## Usage
 
 Click a row to see the full list of APIs a key allows. Click a column
 header to sort. Click the scan icon to run a new scan. Click the
@@ -118,8 +118,9 @@ printer icon to print or save as PDF.
 
 ## Security
 
-The dashboard shows your org ID, project IDs, and key metadata. Keep
-the service behind authentication. Treat an exported file as sensitive.
+This application does not contain a built-in authentication system, and relies on 
+Identity-Aware Proxy (IAP) for authentication and coarse-grained authorisation. 
+An unprotected deployment exposes organisation project identifiers and key metadata.
 
 ## Disclaimer
 
